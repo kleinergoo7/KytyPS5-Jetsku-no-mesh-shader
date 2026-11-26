@@ -904,7 +904,8 @@ void TestParkingLock() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 256; count++) {
+    // write_watchers is 16 bits: 65536 watches to trip the overflow check.
+    for (uint32_t count = 0; count < 65536; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
