@@ -1,0 +1,428 @@
+name: Build and Release KytyPS5 (Manual U59)
+
+# Merged from upstream's u59-windows-release.yml + u59-linux.yml
+# (ci/linux-fix-int22): the same U59 PGO Windows build and the same Linux
+# build, but manual-trigger only, with the release published once by a
+# release job instead of by the Windows job. Nothing here names a repository:
+# artifact names follow the repository, and any fork/branch can dispatch it.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  KYTY_BUILD_ORIGIN: ${{ vars.KYTY_BUILD_ORIGIN || 'Fork' }}
+  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+  REPO_NAME: ${{ github.event.repository.name }}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  metadata:
+    name: Prepare build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.value }}
+
+    steps:
+      - name: Generate release tag
+        id: release_tag
+        shell: bash
+        run: |
+          # run_id keeps concurrent dispatches of one commit on separate tags.
+          echo "value=${{ env.REPO_NAME }}-U59-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build KytyPS5 U59 (Windows)
+    needs: metadata
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache LLVM installer
+        id: llvm_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/LLVM-22.1.3-win64.exe
+          key: llvm-22.1.3-win64-${{ runner.os }}-${{ runner.arch }}
+
+      # The PGO profile in tools/pgo was merged with LLVM 22.1.3's llvm-profdata (the clang-cl of
+      # Visual Studio 18, llvm-project e9846648f); the compiler that reads it must be the same release.
+      # No sccache here: the profile is an untracked compiler input, so a cached
+      # compile could silently reuse objects built against an older profile.
+      - name: Install precompiled LLVM 22.1.3
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.3-win64.exe'
+          if ("${{ steps.llvm_cache.outputs.cache-hit }}" -ne "true") {
+            Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe' -OutFile $installer
+          }
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne '72ca54c3b7940615776d8994c0b918a1d8c4981bdcf13b439eaa86a1bd477001') { throw 'LLVM checksum mismatch' }
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\LLVM-22.1.3' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited with $($process.ExitCode)" }
+          $version = & 'C:\LLVM-22.1.3\bin\clang-cl.exe' --version | Select-Object -First 1
+          Write-Host $version
+          if ($version -notmatch 'clang version 22\.1\.3\b') { throw "Unexpected clang-cl: $version" }
+          foreach ($tool in 'lld-link.exe', 'llvm-lib.exe') {
+            if (-not (Test-Path -LiteralPath "C:\LLVM-22.1.3\bin\$tool")) { throw "$tool missing" }
+          }
+          'C:\LLVM-22.1.3\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache precompiled glslang
+        id: glslang_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/glslang
+          key: glslang-16.6.0-windows-x86_64-release-${{ runner.os }}-${{ runner.arch }}
+
+      # Pinned to the latest stable release with published binaries (16.6.0): no
+      # vcpkg source build, no api.github.com lookup, checksum verified.
+      - name: Install precompiled glslang
+        shell: pwsh
+        run: |
+          $version = "16.6.0"
+          $destination = Join-Path $env:RUNNER_TEMP "glslang"
+          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
+            $archive = Join-Path $env:RUNNER_TEMP "glslang.zip"
+            Invoke-WebRequest -Uri "https://github.com/KhronosGroup/glslang/releases/download/$version/glslang-$version-windows-x86_64-release.zip" -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne "82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b") {
+              throw "glslang archive checksum mismatch"
+            }
+            Expand-Archive -Path $archive -DestinationPath $destination -Force
+            Remove-Item $archive
+          }
+          $validator = Get-ChildItem $destination -Recurse -File -Filter glslangValidator.exe | Select-Object -First 1
+          if (-not $validator) {
+            $validator = Get-ChildItem $destination -Recurse -File -Filter glslang.exe | Select-Object -First 1
+            if (-not $validator) { throw "glslang executable not found" }
+            Copy-Item $validator.FullName (Join-Path $validator.DirectoryName "glslangValidator.exe")
+          }
+          & (Join-Path $validator.DirectoryName "glslangValidator.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "glslang validation failed" }
+          $validator.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      # clang-cl names functions in anonymous namespaces after a hash of the source path on the compile
+      # command line, and PGO finds functions by name. The profile was recorded from C:\kyty-src19, a
+      # junction to the checkout, so the release compiles from the same path (CMake keeps the junction).
+      - name: Map the source to the PGO path
+        shell: cmd
+        run: |
+          if exist C:\kyty-src19 rmdir C:\kyty-src19
+          mklink /J C:\kyty-src19 "%GITHUB_WORKSPACE%"
+          if errorlevel 1 exit /b 1
+          git config --global --add safe.directory C:/kyty-src19
+
+      - name: Configure Release
+        shell: cmd
+        run: |
+          set LLVM=C:/LLVM-22.1.3/bin
+          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int22-1.profdata
+          cmake -S C:\kyty-src19 -B _Build/windows ^
+            -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DKYTY_EMULATOR_IPO=ON ^
+            -DKYTY_CP_DIAGNOSTICS=OFF ^
+            -DKYTY_MARCH=x86-64-v3 ^
+            -DKYTY_PGO_USE=%PGO_PROFILE% ^
+            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
+            -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
+            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
+            -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
+            -DCMAKE_AR=%LLVM%/llvm-lib.exe ^
+            -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%"
+
+      - name: Check the PGO source path
+        shell: pwsh
+        run: |
+          # The training build compiled C:\kyty-src19\src\... spelled with backslashes; any other spelling
+          # renames every function in an anonymous namespace and loses its profile.
+          $ninja = Get-Content -LiteralPath '_Build/windows/build.ninja' -Raw
+          if (-not $ninja.Contains('C$:\kyty-src19\src\emulator.cpp')) {
+            throw 'build.ninja does not compile C:\kyty-src19\src\emulator.cpp: the PGO profile would only partly apply.'
+          }
+          Write-Host "MSVC tools $env:VCToolsVersion (the profile's standard-library code: 14.51.36231)"
+
+      - name: Build and install
+        shell: cmd
+        run: |
+          rem -Wprofile-instr-missing (diagnostics only) reports, per file, the functions the profile has no data for.
+          rem clang-cl prepends CL to its arguments (_CL_ would land after CMake's "--" and count as a file).
+          set CL=-Wprofile-instr-missing
+          cmake --build _Build/windows --target launcher kyty_emulator --parallel > pgo-build.log 2>&1
+          set BUILD_EXIT=%ERRORLEVEL%
+          set CL=
+          type pgo-build.log
+          if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
+          cmake --install _Build/windows --prefix _Build/windows/install
+
+      - name: Show build errors
+        if: failure()
+        shell: pwsh
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first error lines as annotations.
+          if (Test-Path -LiteralPath 'pgo-build.log') {
+            $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-String -Pattern 'error|FAILED|fatal' | Select-Object -First 8)
+            if (-not $lines) { $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-Object -Last 8) }
+            foreach ($line in $lines) { Write-Host ('::error::' + "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')) }
+          } else { Write-Host '::error::pgo-build.log was not written' }
+
+      - name: Report PGO coverage
+        shell: pwsh
+        run: |
+          # Functions with mismatched or missing profile data are optimized without it (not an error). The int22
+          # profile was recorded from C:\kyty-src19; source changes since then show up as mismatches below.
+          $log = Get-Content -LiteralPath 'pgo-build.log'
+          $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
+          $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
+          $missing = & $sum 'profile data may be incomplete: of \d+ functions?, (\d+)'
+          Write-Host "PGO: $([int]$mismatched) functions with mismatched profile data, $([int]$missing) without profile data"
+          if ($mismatched -gt 0) { Write-Host "::warning::PGO: $mismatched functions have mismatched profile data" }
+
+      - name: Package portable experimental runtime
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
+          $release = Join-Path $env:RUNNER_TEMP "$env:REPO_NAME-U59-Windows-x64"
+          New-Item -ItemType Directory -Path $release | Out-Null
+          Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
+          Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
+          # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
+          Get-ChildItem -Path 'tools' -Filter 'u59-preset.*.json' | Copy-Item -Destination $release
+          # The launcher's Export list button runs kyty_pipeline_list.exe; the shipped shader lists
+          # (tools/PipelineLists) are what its Precompile button finds. Both come from cmake --install. Every list
+          # of the tree has to be in the package; the two Astro lists are named, so losing them from the tree fails too.
+          $lists = @('PPSA21567.kyplst', 'PPSA01325.kyplst') + @(Get-ChildItem -Path 'tools/PipelineLists' -Filter '*.kyplst' | ForEach-Object Name) | Select-Object -Unique
+          foreach ($file in @('kyty_pipeline_list.exe') + ($lists | ForEach-Object { "PipelineLists/$_" })) {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $file))) { throw "$file is missing from the package." }
+          }
+          if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
+            throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
+          }
+          Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
+          Copy-Item -LiteralPath 'LICENSE' -Destination $release
+          # libFont's fallback font: the emulator looks for it under its working directory (the launcher starts it
+          # in its own folder) when the build-time source path does not exist, as on every user's PC.
+          $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'
+          New-Item -ItemType Directory -Path $fonts | Out-Null
+          Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
+          if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
+          Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
+          $archive = Join-Path $env:GITHUB_WORKSPACE "$env:REPO_NAME-U59-Windows-x64.zip"
+          Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPO_NAME }}-U59-Windows-x64
+          path: ${{ env.REPO_NAME }}-U59-Windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Build KytyPS5 U59 (Linux)
+    needs: metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Installs the packages and caches them; on a cache hit the install is
+      # skipped and the packages are restored from an archive instead.
+      # ImageOS/ImageVersion are runner shell variables, not workflow env:
+      # export them first or the cache key never invalidates on image rotation.
+      - name: Export runner image variables
+        shell: bash
+        run: |
+          echo "ImageOS=$ImageOS" >> "$GITHUB_ENV"
+          echo "ImageVersion=$ImageVersion" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        uses: awalsh128/cache-apt-pkgs-action@v2.0.0
+        with:
+          packages: clang glslang-tools libasound2-dev libdbus-1-dev libgl1-mesa-dev libpulse-dev libudev-dev libwayland-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev libxkbcommon-dev libxrandr-dev libxss-dev libxtst-dev lld ninja-build pkg-config wayland-protocols
+          version: 1.0-${{ env.ImageOS }}-${{ env.ImageVersion }}
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure Release
+        shell: bash
+        run: |
+          cmake -S . -B _Build/linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKYTY_EMULATOR_IPO=ON \
+            -DKYTY_CP_DIAGNOSTICS=OFF \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$GITHUB_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build _Build/linux --target launcher kyty_emulator page_manager_tests memory_tracker_tests \
+            lru_cache_tests virtual_memory_allocation_tests resource_tracking_tests scalar_provenance_tests \
+            resource_materialization_tests shader_vertex_metadata_tests device_compat_tests --parallel \
+            -- -k 0 2>&1 | tee linux-build.log
+
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first errors as annotations.
+          if [ -f linux-build.log ]; then
+            grep -E 'error:|FAILED:|undefined reference|fatal' linux-build.log | sort -u | head -n 40 |
+              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+          else
+            echo "::error::linux-build.log was not written"
+          fi
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/linux --output-on-failure \
+            -R '^(lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation|device_compat)$' \
+            2>&1 | tee linux-test.log
+
+      - name: Show test failures
+        if: failure()
+        shell: bash
+        run: |
+          # The failing tests' output as annotations, so a failure can be read from the run summary
+          # (and the checks API) without the full log.
+          if [ -f linux-test.log ]; then
+            grep -n -B 2 -A 14 -E 'Failed|\*\*\*|Check failed|failed:' linux-test.log | head -n 60 | \
+              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+          else
+            echo "::error::linux-test.log was not written"
+          fi
+
+      - name: Package portable experimental runtime
+        shell: bash
+        run: |
+          cmake --install _Build/linux --prefix _Build/linux/install
+          release="$RUNNER_TEMP/$REPO_NAME-U59-Linux-x86_64"
+          mkdir -p "$release"
+          cp -a _Build/linux/install/. "$release/"
+          cp tools/u59-preset.json "$release/"
+          # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
+          find tools -maxdepth 1 -name 'u59-preset.*.json' -exec cp {} "$release/" \;
+          cp docs/EXPERIMENTAL.md "$release/U59-README.md"
+          cp docs/LINUX-U59.md "$release/LINUX-U59.md"
+          cp LICENSE "$release/"
+          # libFont's fallback font, as in the Windows archive.
+          fonts="$release/3rdparty/tracy/profiler/src/font"
+          mkdir -p "$fonts"
+          cp 3rdparty/tracy/profiler/src/font/Roboto-*.ttf "$fonts/"
+          test "$(ls "$fonts"/Roboto-*.ttf | wc -l)" -eq 4
+          cp 3rdparty/SPIRV-Tools/LICENSE "$fonts/LICENSE-Apache-2.0.txt"
+          chmod a+x "$release/kyty_launcher" "$release/kyty_emulator"
+          [[ "$(file -b "$release/kyty_emulator")" == *"x86-64"* ]]
+          "$release/kyty_emulator" --help > /dev/null
+          tar -C "$release" -czf "$REPO_NAME-U59-Linux-x86_64.tar.gz" .
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPO_NAME }}-U59-Linux-x86_64
+          path: ${{ env.REPO_NAME }}-U59-Linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release KytyPS5 U59 (Manual)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      needs.windows.result == 'success' &&
+      needs.linux.result == 'success'
+    needs: [metadata, windows, linux]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+
+    steps:
+      - name: Check out source for release notes
+        uses: actions/checkout@v4
+
+      - name: Download Windows archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.REPO_NAME }}-U59-Windows-x64
+          path: assets
+
+      - name: Download Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.REPO_NAME }}-U59-Linux-x86_64
+          path: assets
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=()
+          for artifact in \
+            "$REPO_NAME-U59-Windows-x64.zip" \
+            "$REPO_NAME-U59-Linux-x86_64.tar.gz"; do
+            if [[ -f "assets/$artifact" ]]; then
+              assets+=("assets/$artifact")
+            fi
+          done
+          ls -l assets/ || true
+          test "${#assets[@]}" -eq 2
+          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_NAME" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            # docs/release-notes.md: the first line is the title ("# ..."), the rest the notes.
+            # Falls back to generated notes so any repo gets a release.
+            notes_args=(--generate-notes --title "$RELEASE_NAME")
+            if [[ -f docs/release-notes.md ]]; then
+              title="$(sed -n '1s/^# *//p' docs/release-notes.md | head -n 1)"
+              tail -n +2 docs/release-notes.md > release-notes-body.md
+              notes_args=(--title "$title" --notes-file release-notes-body.md)
+            fi
+            gh release create "$RELEASE_NAME" "${assets[@]}" "${notes_args[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA"
+          fi
